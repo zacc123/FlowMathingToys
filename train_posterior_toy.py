@@ -73,6 +73,8 @@ class Config:
     train_steps: int = 20_000
     lr: float = 1e-3
     hidden_dim: int = 256
+    target: str = "gmm"
+    radius: float = 1.0
 
     # Toy GMM prior
     sigma: float = 0.25  # covariance = sigma^2 * I
@@ -85,6 +87,7 @@ class Config:
     eval_every: int = 1000
     log_every: int = 200
     checkpoint_every: int = 1000
+    posterior_dist: str = "gmm"
 
     # Posterior / FLOWER toy
     posterior_hx: float = 1.5
@@ -160,12 +163,24 @@ class TargetGMM:
         self.num_components = self.means.shape[0]
 
     def sample(self, n: int) -> torch.Tensor:
-        comp_ids = torch.randint(
-            low=0,
-            high=self.num_components,
-            size=(n,),
-            device=self.device,
-        )
+        # comp_ids = torch.randint(
+        #     low=0,
+        #     high=self.num_components,
+        #     size=(n,),
+        #     device=self.device,
+        # )
+        # Guaranteed equal counts (assumes n divisible by 3)
+        base = n // self.num_components
+        remainder = n % self.num_components
+    
+        # Give the remainder to the first `remainder` components
+        counts = [base + (1 if i < remainder else 0) for i in range(self.num_components)]
+        
+        comp_ids = torch.cat([
+            torch.full((count,), i, device=self.device)
+            for i, count in enumerate(counts)
+        ])
+        comp_ids = comp_ids[torch.randperm(len(comp_ids), device=self.device)]
         chosen_means = self.means[comp_ids]
         noise = self.sigma * torch.randn(n, 2, device=self.device)
         return chosen_means + noise
@@ -174,6 +189,65 @@ class TargetGMM:
         return (self.sigma ** 2) * torch.eye(2, device=self.device)
 
 
+class TargetCircularGMM:
+    def __init__(
+        self,
+        device: str = "cpu",
+        radius: float = 0.5,
+        sigma: float = 0.0,          # optional radial jitter (0 = perfect ring)
+        means_scale: float = 0.25,
+    ):
+        self.device = device
+        self.radius = float(radius)
+        self.sigma = float(sigma)
+        s = float(means_scale)
+        self.means = torch.tensor(
+            [
+                [-s,  s],
+                [ s, -s],
+                [ -s, -s],
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        self.num_components = self.means.shape[0]
+
+    def sample(self, n: int) -> torch.Tensor:
+        # Equal counts per component (handles remainder too)
+        base = n // self.num_components
+        remainder = n % self.num_components
+        counts = [base + (1 if i < remainder else 0) for i in range(self.num_components)]
+
+        comp_ids = torch.cat([
+            torch.full((count,), i, device=self.device)
+            for i, count in enumerate(counts)
+        ])
+        comp_ids = comp_ids[torch.randperm(len(comp_ids), device=self.device)]
+
+        chosen_means = self.means[comp_ids]           # (n, 2)
+
+        # Sample a uniform angle in [0, 2π) for each point
+        angles = 2 * math.pi * torch.rand(n, device=self.device)  # (n,)
+
+        # Convert to unit-circle direction vectors
+        directions = torch.stack([angles.cos(), angles.sin()], dim=-1)  # (n, 2)
+
+        # Place each point on (or near) the ring
+        r = self.radius
+        if self.sigma > 0:
+            r = r + self.sigma * torch.randn(n, device=self.device)   # radial jitter
+            r = r.unsqueeze(-1)                                        # (n, 1)
+
+        return chosen_means + r * directions
+
+    def cov(self) -> torch.Tensor:
+        """
+        Approximate marginal covariance for one component.
+        For a perfect ring: Cov = (r²/2) I
+        With radial jitter σ: Cov = ((r² + σ²)/2) I
+        """
+        var = (self.radius ** 2 + self.sigma ** 2) / 2.0
+        return var * torch.eye(2, device=self.device)
 # ============================================================
 # Coupling
 # ============================================================
@@ -274,7 +348,7 @@ def sample_prior_flow(model: nn.Module, n: int, device: str, num_steps: int = 20
         if mode == "rf":
             step_size = 1.0 / num_steps
         elif mode == "ecrf":
-            step_size = 1.0 / (num_steps - i)
+            step_size =  1.0 / (num_steps - i)
         else:
             raise ValueError(f"Unknown sampling mode: {mode}")
 
@@ -296,7 +370,7 @@ def sample_prior_trajectories(model: nn.Module, n: int, device: str, num_steps: 
         if mode == "rf":
             step_size = 1.0 / num_steps
         elif mode == "ecrf":
-            step_size = 1.0 / (num_steps - i)
+            step_size = 1 / (num_steps - i)
         else:
             raise ValueError(f"Unknown sampling mode: {mode}")
 
@@ -477,6 +551,107 @@ def sample_exact_posterior(means: torch.Tensor, sigma: float, h: torch.Tensor, y
     noise = torch.randn(n, 2, device=means.device) @ L.T
     return chosen_means + noise
 
+def circular_posterior_params(
+    means: torch.Tensor,       # (K, 2)  component means
+    radius: float,
+    h: torch.Tensor,           # (2,)    measurement vector
+    y: float,                  # scalar  observation
+    sigma_n: float,            # observation noise std
+    n_grid: int = 2048,        # angle grid resolution
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns posterior weights and angle distributions for each component.
+
+    For component k, the posterior over angle θ is:
+        p(θ | y, k)  ∝  exp( -(y - h·μ_k - r·(h·d(θ)))² / (2 σ_n²) )
+    where d(θ) = [cos θ, sin θ].
+
+    Returns
+    -------
+    comp_weights  : (K,)       posterior weight of each component
+    log_angle_pdf : (K, G)     log-pdf over the angle grid for each component
+                               (already normalised within each component)
+    angles        : (G,)       the angle grid in [0, 2π)
+    """
+    device = means.device
+    K = means.shape[0]
+    h = h.reshape(2).to(device)
+    h_norm = h.norm()
+    h_unit = h / (h_norm + 1e-8)        # direction only
+    sigma_n_eff = sigma_n / (h_norm + 1e-8)  # rescaled noise
+    y_eff = y / (h_norm + 1e-8)              # rescaled observat
+
+    # Angle grid  (G,)
+    angles = torch.linspace(0, 2 * math.pi, n_grid + 1, device=device)[:-1]
+    d = torch.stack([angles.cos(), angles.sin()], dim=-1)  # (G, 2)
+
+    # h·d(θ)  (G,)
+    h_dot_d = d @ h_unit  # (G,)
+
+    # For each component k: residual = y - h·μ_k - r·(h·d(θ))
+    h_dot_mu = means @ h_unit          # (K,)
+    residuals = (y_eff - h_dot_mu).unsqueeze(-1) - radius * h_dot_d.unsqueeze(0)  # (K, G)
+
+    # Log-likelihood over grid for each component
+    log_liks = -0.5 * (residuals ** 2) / (sigma_n_eff ** 2)  # (K, G)
+
+    # Normalise within each component → posterior angle pdf
+    log_angle_pdf = log_liks - torch.logsumexp(log_liks, dim=-1, keepdim=True)  # (K, G)
+
+    # Marginal log-likelihood per component (log-mean-exp over uniform angle prior)
+    # log p(y | k) = log (1/G Σ_θ p(y|θ,k))  =  logsumexp - log G
+    log_comp_liks = torch.logsumexp(log_liks, dim=-1) - math.log(n_grid)  # (K,)
+
+    # Equal component priors → posterior weights
+    log_comp_weights = log_comp_liks - torch.logsumexp(log_comp_liks, dim=0)
+    comp_weights = torch.exp(log_comp_weights)  # (K,)
+
+    return comp_weights, log_angle_pdf, angles
+
+
+def sample_circular_posterior(
+    comp_weights: torch.Tensor,   # (K,)
+    log_angle_pdf: torch.Tensor,  # (K, G)
+    angles: torch.Tensor,         # (G,)
+    means: torch.Tensor,          # (K, 2)
+    radius: float,
+    n: int,
+    sigma: float = 0.0,           # optional radial jitter
+) -> torch.Tensor:
+    """
+    Draw n samples from the circular posterior by:
+      1. Sampling a component from comp_weights.
+      2. Sampling an angle from that component's discrete pdf.
+      3. Converting (component, angle) → 2D point on the ring.
+    """
+    device = means.device
+    K = comp_weights.shape[0]
+
+    # Equal counts per component weighted by posterior
+    comp_ids = torch.multinomial(comp_weights, num_samples=n, replacement=True)  # (n,)
+
+    # For each sample, draw an angle from the component's angle distribution
+    # Gather each sample's log-pdf row
+    angle_log_pdfs = log_angle_pdf[comp_ids]   # (n, G)
+    angle_probs = torch.exp(angle_log_pdfs)    # (n, G)  — already normalised
+
+    sampled_angle_idx = torch.multinomial(angle_probs, num_samples=1).squeeze(-1)  # (n,)
+    sampled_angles = angles[sampled_angle_idx]  # (n,)
+
+    # Optional: add small angular jitter so samples aren't grid-locked
+    dtheta = angles[1] - angles[0]
+    sampled_angles = sampled_angles + dtheta * (torch.rand(n, device=device) - 0.5)
+
+    # Convert to 2D
+    directions = torch.stack([sampled_angles.cos(), sampled_angles.sin()], dim=-1)  # (n, 2)
+    chosen_means = means[comp_ids]  # (n, 2)
+
+    r = radius
+    if sigma > 0:
+        r = radius + sigma * torch.randn(n, device=device).unsqueeze(-1)
+
+    return chosen_means + r * directions
+
 
 # ============================================================
 # FLOWER-style posterior sampler
@@ -505,6 +680,7 @@ def prox_linear_likelihood(
     denom      = sigma_n ** 2 + lam * h_sq                    # scalar
     step       = (lam / denom) * hz_minus_y * h_row           # (n, 2)
     return z - step
+#return z - step
 
 
 @torch.no_grad()
@@ -572,6 +748,7 @@ def sample_flower_posterior(
     for k in range(num_steps):
         t_scalar = k * dt
         t        = torch.full((n, 1), t_scalar, device=device)
+        
  
         # ---------------------------------------------------------- #
         # Step 1 — Destination estimate  [Algorithm 1, line 5]
@@ -589,6 +766,9 @@ def sample_flower_posterior(
  
         elif mode == "ecrf":
             # v ≈ x1 - xt  =>  x1_hat = xt + v
+            # if t_scalar > 0.8:
+            #     t = torch.full((n, 1), 0.8, device=device)
+            # v = model(x, t)
             x1_hat = x + v
  
             # Same Proposition-1 derivation but the (1-t) numerator
@@ -647,12 +827,20 @@ def sample_flower_posterior(
         # eps is resampled fresh each step (per Algorithm 1, line 11).
         # ---------------------------------------------------------- #
         eps = torch.randn(n, 2, device=device)
+
+        # if mode == "ecrf":
+        #     if k != num_steps:
+        #         step_size = (1.0 - t_scalar) / (num_steps - k)
+        #     else:
+        #         step_size = (1.0 - t_scalar) / (num_steps - k)
+
+        #     x   = (1.0 - t_scalar - step_size) * eps + (t_scalar + step_size) * x1_tilde
+        # else:
         x   = (1.0 - t_scalar - dt) * eps + (t_scalar + dt) * x1_tilde
         if k % 200 == 0:
             print("X: ", x[0])
             print("X1_ti: ", x1_tilde[0])
             print("X1_hat: ", x1_hat[0])
- 
         if return_traj:
             traj.append(x.detach().cpu().clone())
  
@@ -684,16 +872,36 @@ def run_prior_evaluation(model: nn.Module, target_dist: TargetGMM, out_dir: str 
 
 
 @torch.no_grad()
-def plot_posterior_comparison(model: nn.Module, target_dist: TargetGMM, save_path: str | Path, h: torch.Tensor, y: float, sigma_n: float, num_samples: int = 5000, num_steps: int = 1000, mode: str = "ecrf", plot_range: float = 1.5) -> None:
-    exact_samples = sample_exact_posterior(
+def plot_posterior_comparison(model: nn.Module, target_dist: TargetGMM, save_path: str | Path, h: torch.Tensor, y: float, sigma_n: float, num_samples: int = 5000, num_steps: int = 1000, mode: str = "ecrf", plot_range: float = 1.5, post_target:str ="gmm") -> None:
+    
+    if post_target == "gmm":
+        exact_samples = sample_exact_posterior(
+            means=target_dist.means,
+            sigma=target_dist.sigma,
+            h=h.to(target_dist.means.device),
+            y=y,
+            sigma_n=sigma_n,
+            n=num_samples,
+        ).cpu().numpy()
+    elif post_target == "circle":
+        comp_weights, log_angle_pdf, angles = circular_posterior_params(
         means=target_dist.means,
-        sigma=target_dist.sigma,
+        radius=target_dist.radius,
         h=h.to(target_dist.means.device),
         y=y,
         sigma_n=sigma_n,
-        n=num_samples,
-    ).cpu().numpy()
-
+    )
+        exact_samples = sample_circular_posterior(
+            comp_weights=comp_weights,
+            log_angle_pdf=log_angle_pdf,
+            angles=angles,
+            means=target_dist.means,
+            radius=target_dist.radius,
+            n=num_samples,
+            sigma=target_dist.sigma,
+        ).cpu().numpy()
+    else:
+        raise NotImplementedError("AHHHH")
     if mode == "ecrf" or mode =="rf":
         flower_g0 = sample_flower_posterior(
             model=model,
@@ -745,6 +953,9 @@ def plot_posterior_comparison(model: nn.Module, target_dist: TargetGMM, save_pat
         ys = (y - h_np[0] * xs) / h_np[1]
         for ax in axes:
             ax.plot(xs, ys, linestyle="--", linewidth=1)
+    else:
+        for ax in axes:
+            ax.axvline(y / h_np[0], linestyle="--", linewidth=1)
 
     for ax in axes:
         ax.set_aspect("equal")
@@ -776,7 +987,10 @@ def train_prior(config: Config):
     with open(run_dir / "config.json", "w") as f:
         json.dump(asdict(config), f, indent=2)
 
-    target_dist = TargetGMM(device=config.device, sigma=config.sigma, means_scale=config.means_scale)
+    if config.target == "circle":
+        target_dist = TargetCircularGMM(device=config.device, sigma=config.sigma, means_scale=config.means_scale, radius=config.radius)
+    else:
+        target_dist = TargetGMM(device=config.device, sigma=config.sigma, means_scale=config.means_scale)
     model = VelocityMLP(hidden_dim=config.hidden_dim).to(config.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     ot_matcher = torchcfm.ExactOptimalTransportConditionalFlowMatcher(sigma=0.0) if (config.coupling == "mbot" and HAS_TORCHCFM) else None
@@ -802,12 +1016,12 @@ def train_prior(config: Config):
         pred = model(xt, t)
         target = training_target(config.mode, xt, x0, x1)
         if config.mode == "ecrf":
-            weight = 1.0 / ((1 - t)**2 + 1e-6)
-            eps = 1e-6
-            # weight_corr = 1.0 / (target.norm(dim=1).pow(2) + eps)
-            # loss = (weight_corr * ((pred - target)**2).norm(dim=1)).sum() / weight_corr.sum()
-            loss = (weight * ((pred - target)**2).norm(dim=1)).sum() / weight.sum()
-            # loss = ((pred - target)**2).mean()
+            # t_clamped = t.clamp(max=0.95)
+            weight = 1.0 / ((1 - t).pow(2).clamp(0.01, 1))
+            loss = ((weight * ((pred - target).pow(2)).sum(dim=1)).sum() / weight.sum())
+            # weight_corr = 1.0 / (target.norm(dim=1).pow(2) * (1 - t).pow(2) + eps)
+            # loss = (weight_corr * ((pred - target).pow(2)).norm(dim=1)).sum() / weight_corr.sum()
+            # loss = F.mse_loss(pred, target)
         elif config.mode == "rf":
             loss = F.mse_loss(pred, target)
         else:
@@ -858,6 +1072,7 @@ def build_argparser():
 
     parser.add_argument("--mode", type=str, default="rf", choices=["rf", "ecrf"])
     parser.add_argument("--coupling", type=str, default="independent", choices=["independent", "mbot", "nn"])
+    parser.add_argument("--target", type=str, default="gmm", choices=["gmm", "circle", "nn"])
 
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--train-steps", type=int, default=20_000)
@@ -880,6 +1095,7 @@ def build_argparser():
     parser.add_argument("--posterior-sigma-n", type=float, default=0.25)
     parser.add_argument("--posterior-num-steps", type=int, default=1000)
     parser.add_argument("--posterior-num-samples", type=int, default=5000)
+    parser.add_argument("--posterior-dist", type=str, default="gmm")
 
     parser.add_argument("--out-dir", type=str, default="flow_gmm_runs")
     parser.add_argument("--run-name", type=str, default="toy_gmm")
@@ -888,13 +1104,14 @@ def build_argparser():
     parser.add_argument("--resume-checkpoint", type=str, default="")
 
     parser.add_argument("--vf-grid-size", type=int, default=25)
-    parser.add_argument("--vf-times", type=str, default="0.5,0.75,0.95,0.99,1.0")
+    parser.add_argument("--vf-times", type=str, default="0.6,0.7,0.8,0.9,1.0")
     parser.add_argument("--plot-range", type=float, default=1.5)
 
     parser.add_argument("--skip-train-prior", action="store_true")
     parser.add_argument("--skip-prior-plots", action="store_true")
     parser.add_argument("--skip-posterior-plots", action="store_true")
 
+    parser.add_argument("--radius", type=float, default=1.00)
     return parser
 
 
@@ -932,6 +1149,9 @@ def config_from_args(args) -> Config:
         train_prior=not args.skip_train_prior,
         make_prior_plots=not args.skip_prior_plots,
         make_posterior_plots=not args.skip_posterior_plots,
+        target= args.target,
+        radius = args.radius,
+        posterior_dist = args.posterior_dist,
     )
 
 
@@ -956,7 +1176,10 @@ def main():
     if config.train_prior:
         model, target_dist, losses, run_dir = train_prior(config)
     else:
-        target_dist = TargetGMM(device=config.device, sigma=config.sigma, means_scale=config.means_scale)
+        if config.target == "gmm":
+            target_dist = TargetGMM(device=config.device, sigma=config.sigma, means_scale=config.means_scale)
+        elif config.target == "circle":
+            target_dist = TargetCircularGMM(device=config.device, sigma=config.sigma, means_scale=config.means_scale, radius=config.radius)
         model = VelocityMLP(hidden_dim=config.hidden_dim).to(config.device)
         if not config.resume_checkpoint:
             raise ValueError("When --skip-train-prior is used, provide --resume-checkpoint to load a trained model.")
@@ -989,6 +1212,7 @@ def main():
             num_steps=config.posterior_num_steps,
             mode=config.mode,
             plot_range=config.plot_range,
+            post_target=config.posterior_dist
         )
         print(f"Posterior comparison saved to: {run_dir / 'posterior_comparison.png'}")
 
